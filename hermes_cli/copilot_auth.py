@@ -44,6 +44,7 @@ def is_copilot_url(url: str) -> bool:
     lower = (url or "").lower()
     return (
         "api.githubcopilot.com" in lower
+        or "models.github.ai" in lower
         or COPILOT_API_BASE_URL.lower().rstrip("/") in lower
     )
 

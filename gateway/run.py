@@ -2530,9 +2530,14 @@ class GatewayRunner:
                     adapter._pending_messages[_quick_key] = queued_event
                 return "Queued for the next turn."
 
-            # /model must not be used while the agent is running.
+            # /model — queue for post-turn execution instead of blocking or erroring.
+            # The pending event is picked up by _process_message_background after the
+            # current turn completes, dispatching it through the normal command pipeline.
             if _cmd_def_inner and _cmd_def_inner.name == "model":
-                return "Agent is running — wait or /stop first, then switch models."
+                adapter = self.adapters.get(source.platform)
+                if adapter:
+                    adapter._pending_messages[_quick_key] = event
+                return "⏳ Model switch queued — will open after this turn."
 
             # /approve and /deny must bypass the running-agent interrupt path.
             # The agent thread is blocked on a threading.Event inside

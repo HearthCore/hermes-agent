@@ -176,6 +176,30 @@ class TestCommandBypassActiveSession:
             "/background response was not sent back to the user"
         )
 
+    @pytest.mark.asyncio
+    async def test_model_bypasses_guard(self):
+        """/model must bypass active-session guard (queued command flow)."""
+        adapter = _make_adapter()
+        sk = _session_key()
+        adapter._active_sessions[sk] = asyncio.Event()
+
+        await adapter.handle_message(_make_event("/model"))
+
+        assert sk not in adapter._pending_messages
+        assert any("handled:model" in r for r in adapter.sent_responses)
+
+    @pytest.mark.asyncio
+    async def test_queue_bypasses_guard(self):
+        """/queue must bypass active-session guard (handled in runner)."""
+        adapter = _make_adapter()
+        sk = _session_key()
+        adapter._active_sessions[sk] = asyncio.Event()
+
+        await adapter.handle_message(_make_event("/queue do this next"))
+
+        assert sk not in adapter._pending_messages
+        assert any("handled:queue" in r for r in adapter.sent_responses)
+
 
 # ---------------------------------------------------------------------------
 # Tests: non-bypass messages still get queued
@@ -292,6 +316,31 @@ class TestPendingCommandSafetyNet:
         # The safety net splits on whitespace and takes the first word
         # after stripping '/'.  For '/path/to/file', that's 'path/to/file'.
         assert resolve_command("path/to/file") is None
+
+
+# ---------------------------------------------------------------------------
+# Tests: queued slash commands stay as events for post-turn dispatch
+# ---------------------------------------------------------------------------
+
+
+class TestPendingCommandEventPreservation:
+    """Queued slash commands must remain MessageEvents for pipeline dispatch."""
+
+    def test_dequeue_pending_text_requeues_known_slash_command_event(self):
+        from gateway.run import _dequeue_pending_text
+
+        adapter = _make_adapter()
+        sk = _session_key()
+        event = _make_event("/model")
+        adapter._pending_messages[sk] = event
+
+        pending_text = _dequeue_pending_text(adapter, sk)
+
+        # Command should not be converted to plain text recursion input.
+        assert pending_text is None
+        # Event must remain queued for process_message() post-turn dispatch.
+        assert sk in adapter._pending_messages
+        assert adapter._pending_messages[sk] is event
 
 
 # ---------------------------------------------------------------------------

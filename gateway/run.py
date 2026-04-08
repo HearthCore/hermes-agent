@@ -339,14 +339,33 @@ def _dequeue_pending_text(adapter, session_key: str) -> str | None:
 
     Preserves media context for captionless photo/document events by
     building a placeholder so the message isn't silently dropped.
+
+    Important: If the pending event is a slash command, re-queue the full
+    event and return None. Command events must be dispatched via the normal
+    gateway message pipeline (process_message), not recursed into _run_agent
+    as plain user text.
     """
     event = adapter.get_pending_message(session_key)
     if not event:
         return None
-    text = event.text
+
+    # Keep command events for post-turn message-pipeline dispatch.
+    text = (event.text or "").strip()
+    if text.startswith("/"):
+        parts = text.split(None, 1)
+        cmd_word = parts[0][1:].lower() if parts else ""
+        if cmd_word:
+            try:
+                from hermes_cli.commands import resolve_command as _resolve_pending_cmd
+                if _resolve_pending_cmd(cmd_word):
+                    adapter._pending_messages[session_key] = event
+                    return None
+            except Exception:
+                pass
+
     if not text and getattr(event, "media_urls", None):
         text = _build_media_placeholder(event)
-    return text
+    return text or None
 
 
 def _check_unavailable_skill(command_name: str) -> str | None:
@@ -7298,8 +7317,11 @@ class GatewayRunner:
                     first_response = result.get("final_response", "")
                     if first_response and not _already_streamed:
                         try:
-                            await adapter.send(source.chat_id, first_response,
-                                               metadata=getattr(event, "metadata", None))
+                            await adapter.send(
+                                source.chat_id,
+                                first_response,
+                                metadata=_progress_metadata,
+                            )
                         except Exception as e:
                             logger.warning("Failed to send first response before queued message: %s", e)
                 # else: interrupted — discard the interrupted response ("Operation

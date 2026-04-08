@@ -367,8 +367,31 @@ def _dequeue_pending_event(adapter, session_key: str) -> MessageEvent | None:
     Queued follow-ups must preserve their media metadata so they can re-enter
     the normal image/STT/document preprocessing path instead of being reduced
     to a placeholder string.
+
+    Important: If the pending event is a slash command, re-queue the full
+    event and return None. Command events must be dispatched via the normal
+    gateway message pipeline (process_message), not recursed into _run_agent
+    as plain user text.
     """
-    return adapter.get_pending_message(session_key)
+    event = adapter.get_pending_message(session_key)
+    if not event:
+        return None
+
+    # Keep command events for post-turn message-pipeline dispatch.
+    text = (event.text or "").strip()
+    if text.startswith("/"):
+        parts = text.split(None, 1)
+        cmd_word = parts[0][1:].lower() if parts else ""
+        if cmd_word:
+            try:
+                from hermes_cli.commands import resolve_command as _resolve_pending_cmd
+                if _resolve_pending_cmd(cmd_word):
+                    adapter._pending_messages[session_key] = event
+                    return None
+            except Exception:
+                pass
+
+    return event
 
 
 def _check_unavailable_skill(command_name: str) -> str | None:

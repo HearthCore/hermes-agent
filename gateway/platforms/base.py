@@ -1456,7 +1456,13 @@ class BasePlatformAdapter(ABC):
             # session lifecycle and its cleanup races with the running task
             # (see PR #4926).
             cmd = event.get_command()
-            if cmd in ("approve", "deny", "status", "stop", "new", "reset", "background", "restart"):
+            # Commands that must bypass the running-agent interrupt path:
+            # - approve/deny: agent is blocked on Event.wait() in approval.py
+            # - status: informational, no need to interrupt
+            # - stop/new/reset/background/restart: session control, handled in run.py with explicit interrupt
+            # - model: post-turn config change, must not kill the running agent
+            # - queue/q: queues for next turn, must not interrupt current one
+            if cmd in ("approve", "deny", "status", "stop", "new", "reset", "background", "restart", "model", "queue", "q"):
                 logger.debug(
                     "[%s] Command '/%s' bypassing active-session guard for %s",
                     self.name, cmd, session_key,

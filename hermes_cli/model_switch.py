@@ -784,40 +784,71 @@ def list_authenticated_providers(
 
     # --- 2. Check Hermes-only providers (nous, openai-codex, copilot) ---
     from hermes_cli.providers import HERMES_OVERLAYS
+
+    # Build reverse mapping: models.dev ID -> Hermes provider ID
+    # e.g. "github-copilot" -> "copilot", so overlay keys resolve correctly.
+    _mdev_to_hermes = {v: k for k, v in PROVIDER_TO_MODELS_DEV.items()}
+
     for pid, overlay in HERMES_OVERLAYS.items():
         if pid in seen_slugs:
             continue
+
+        # Resolve the Hermes provider slug for this overlay.
+        # Overlay keys may be models.dev IDs (e.g. "github-copilot") while
+        # the config and curated lists use Hermes IDs (e.g. "copilot").
+        hermes_slug = _mdev_to_hermes.get(pid, pid)
+        if hermes_slug in seen_slugs:
+            continue
+
         # Check if credentials exist
         has_creds = False
         if overlay.extra_env_vars:
             has_creds = any(os.environ.get(ev) for ev in overlay.extra_env_vars)
-        if overlay.auth_type in ("oauth_device_code", "oauth_external", "external_process"):
+        if not has_creds and overlay.auth_type in ("oauth_device_code", "oauth_external", "external_process"):
             # These use auth stores, not env vars — check for auth.json entries
             try:
                 from hermes_cli.auth import _load_auth_store
                 store = _load_auth_store()
-                if store and (pid in store.get("providers", {}) or pid in store.get("credential_pool", {})):
+                providers_store = store.get("providers", {})
+                pool_store = store.get("credential_pool", {})
+                # Check both the overlay key AND the Hermes slug
+                if store and (
+                    pid in providers_store or pid in pool_store
+                    or hermes_slug in providers_store or hermes_slug in pool_store
+                ):
                     has_creds = True
             except Exception as exc:
                 logger.debug("Auth store check failed for %s: %s", pid, exc)
         if not has_creds:
+            # Last resort: check credential pool under Hermes slug too
+            if not has_creds:
+                try:
+                    from hermes_cli.auth import _load_auth_store
+                    store = _load_auth_store()
+                    pool_store = store.get("credential_pool", {})
+                    if hermes_slug in pool_store or pid in pool_store:
+                        has_creds = True
+                except Exception:
+                    pass
+        if not has_creds:
             continue
 
-        # Use curated list
-        model_ids = curated.get(pid, [])
+        # Use curated list — look up by both Hermes slug and overlay key
+        model_ids = curated.get(hermes_slug, []) or curated.get(pid, [])
         total = len(model_ids)
         top = model_ids[:max_models]
 
         results.append({
-            "slug": pid,
-            "name": get_label(pid),
-            "is_current": pid == current_provider,
+            "slug": hermes_slug,
+            "name": get_label(hermes_slug),
+            "is_current": hermes_slug == current_provider or pid == current_provider,
             "is_user_defined": False,
             "models": top,
             "total_models": total,
             "source": "hermes",
         })
         seen_slugs.add(pid)
+        seen_slugs.add(hermes_slug)
 
     # --- 3. User-defined endpoints from config ---
     if user_providers and isinstance(user_providers, dict):

@@ -1480,6 +1480,97 @@ class TelegramAdapter(BasePlatformAdapter):
                     logger.error("Failed to resolve gateway approval from Telegram button: %s", exc)
             return
 
+        # --- Reboot recovery callbacks (rb:action:chat_id) ---
+        if data.startswith("rb:"):
+            parts = data.split(":", 2)
+            action = parts[1] if len(parts) > 1 else ""
+            chat_id = parts[2] if len(parts) > 2 else (str(query.message.chat_id) if query.message else None)
+
+            if action == "resume":
+                await query.answer(text="Fortfahren...")
+                try:
+                    await query.edit_message_reply_markup(reply_markup=None)
+                except Exception:
+                    pass
+                # Inject directly into the gateway dispatch as a synthetic MessageEvent
+                if chat_id:
+                    try:
+                        import hermes_constants, json as _json
+                        home = hermes_constants.get_hermes_home()
+                        resume_path = home / "state" / "reboot_intent.json"
+                        context_hint = ""
+                        if resume_path.exists():
+                            intent = _json.loads(resume_path.read_text())
+                            context_hint = (
+                                f" | Grund: {intent.get('reason', '')} "
+                                f"| Session: {intent.get('session_id', 'unbekannt')} "
+                                f"| Zeit: {intent.get('timestamp', '')}"
+                            )
+                        resume_text = (
+                            f"Hermes, du wurdest gerade neu gestartet.{context_hint} "
+                            f"Bitte schau dir die letzte Session an und fasse kurz zusammen "
+                            f"wo wir stehen. Falls ein offener Task existiert, frag ob du weitermachen sollst."
+                        )
+                        user = query.from_user
+                        msg = query.message
+                        source = self.build_source(
+                            chat_id=chat_id,
+                            chat_name=getattr(msg.chat, "title", None) or getattr(msg.chat, "full_name", None),
+                            chat_type="dm",
+                            user_id=str(user.id) if user else None,
+                            user_name=user.full_name if user else None,
+                        )
+                        event = MessageEvent(
+                            text=resume_text,
+                            source=source,
+                        )
+                        await self.handle_message(event)
+                    except Exception as exc:
+                        logger.error("rb:resume injection failed: %s", exc)
+
+            elif action == "summary":
+                await query.answer(text="Zusammenfassung wird geladen...")
+                try:
+                    await query.edit_message_reply_markup(reply_markup=None)
+                except Exception:
+                    pass
+                if chat_id:
+                    try:
+                        import hermes_constants
+                        home = hermes_constants.get_hermes_home()
+                        resume_path = home / "state" / "reboot_intent.json"
+                        if resume_path.exists():
+                            import json as _json
+                            intent = _json.loads(resume_path.read_text())
+                            lines = [
+                                "*Letzter bekannter Stand:*",
+                                f"Grund: {intent.get('reason', 'unbekannt')}",
+                                f"Session: `{intent.get('session_id', 'unbekannt')}`",
+                                f"Zeit: {intent.get('timestamp', 'unbekannt')}",
+                            ]
+                            if intent.get('links'):
+                                lines.append("Links: " + ", ".join(intent['links']))
+                            await self._app.bot.send_message(
+                                chat_id=int(chat_id),
+                                text="\n".join(lines),
+                                parse_mode=ParseMode.MARKDOWN,
+                            )
+                        else:
+                            await self._app.bot.send_message(
+                                chat_id=int(chat_id),
+                                text="Kein gespeicherter Kontext gefunden.",
+                            )
+                    except Exception as exc:
+                        logger.error("rb:summary send failed: %s", exc)
+
+            elif action == "dismiss":
+                await query.answer(text="Verworfen.")
+                try:
+                    await query.edit_message_reply_markup(reply_markup=None)
+                except Exception:
+                    pass
+            return
+
         # --- Update prompt callbacks ---
         if not data.startswith("update_prompt:"):
             return

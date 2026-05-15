@@ -359,6 +359,7 @@ class TestApiKeyProviderStatus:
         assert status["base_url"] == STEPFUN_STEP_PLAN_CN_BASE_URL
 
     def test_copilot_status_uses_gh_cli_token(self, monkeypatch):
+        monkeypatch.delenv("COPILOT_API_BASE_URL", raising=False)
         monkeypatch.setattr("hermes_cli.copilot_auth._try_gh_cli_token", lambda: "gho_gh_cli_token")
         status = get_api_key_provider_status("copilot")
         assert status["configured"] is True
@@ -414,6 +415,7 @@ class TestResolveApiKeyProviderCredentials:
         assert creds["source"] == "GLM_API_KEY"
 
     def test_resolve_copilot_with_github_token(self, monkeypatch):
+        monkeypatch.delenv("COPILOT_API_BASE_URL", raising=False)
         monkeypatch.setenv("GITHUB_TOKEN", "gh-env-secret")
         creds = resolve_api_key_provider_credentials("copilot")
         assert creds["provider"] == "copilot"
@@ -422,6 +424,7 @@ class TestResolveApiKeyProviderCredentials:
         assert creds["source"] == "GITHUB_TOKEN"
 
     def test_resolve_copilot_with_gh_cli_fallback(self, monkeypatch):
+        monkeypatch.delenv("COPILOT_API_BASE_URL", raising=False)
         monkeypatch.setattr("hermes_cli.copilot_auth._try_gh_cli_token", lambda: "gho_cli_secret")
         creds = resolve_api_key_provider_credentials("copilot")
         assert creds["provider"] == "copilot"

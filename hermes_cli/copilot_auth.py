@@ -13,7 +13,29 @@ Credential search order (matching Copilot CLI behaviour):
   1. COPILOT_GITHUB_TOKEN env var
   2. GH_TOKEN env var
   3. GITHUB_TOKEN env var
-  4. gh auth token  CLI fallback
+  4. gh auth token  CLI fallback (host-aware via COPILOT_GH_HOST)
+
+GitHub Enterprise (GHE) support
+--------------------------------
+Set the following env vars in ~/.hermes/.env to use a GHE Copilot instance:
+
+  COPILOT_GH_HOST=<tenant>.ghe.com
+      Passed as --hostname to `gh auth token` so the GHE token is resolved.
+
+  COPILOT_API_BASE_URL=https://<tenant>.ghe.com/v1
+      Overrides the Copilot inference endpoint (also honoured by ProviderConfig).
+
+  COPILOT_DEVICE_CODE_URL=https://<tenant>.ghe.com/login/device/code
+  COPILOT_ACCESS_TOKEN_URL=https://<tenant>.ghe.com/login/oauth/access_token
+      Override the OAuth device-code flow endpoints.
+
+  COPILOT_TOKEN_EXCHANGE_URL=https://api.<tenant>.ghe.com/copilot_internal/v2/token
+      Override the short-lived Copilot API token exchange endpoint.
+
+  COPILOT_AUTH_MODE=oauth
+      Skip env-var / gh-CLI token lookup and go straight to the device-code
+      flow.  Useful when GH_TOKEN / GITHUB_TOKEN are set to a non-Copilot
+      token and would otherwise poison the lookup.
 """
 
 from __future__ import annotations
@@ -31,6 +53,16 @@ logger = logging.getLogger(__name__)
 
 # OAuth device code flow constants (same client ID as opencode/Copilot CLI)
 COPILOT_OAUTH_CLIENT_ID = "Ov23li8tweQw6odWQebz"
+
+# GHE-overrideable OAuth and token-exchange endpoints.
+# For GitHub Enterprise set these in ~/.hermes/.env — cloud users leave them unset.
+COPILOT_DEVICE_CODE_URL = os.getenv(
+    "COPILOT_DEVICE_CODE_URL", "https://github.com/login/device/code"
+)
+COPILOT_ACCESS_TOKEN_URL = os.getenv(
+    "COPILOT_ACCESS_TOKEN_URL", "https://github.com/login/oauth/access_token"
+)
+
 # Token type prefixes
 _CLASSIC_PAT_PREFIX = "ghp_"
 _SUPPORTED_PREFIXES = ("gho_", "github_pat_", "ghu_")
@@ -41,6 +73,26 @@ COPILOT_ENV_VARS = ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
 # Polling constants
 _DEVICE_CODE_POLL_INTERVAL = 5  # seconds
 _DEVICE_CODE_POLL_SAFETY_MARGIN = 3  # seconds
+
+
+def is_classic_pat(token: str) -> bool:
+    """Check if a token is a classic PAT (ghp_*), which Copilot doesn't support."""
+    return token.strip().startswith(_CLASSIC_PAT_PREFIX)
+
+
+def is_copilot_url(url: str) -> bool:
+    """Return True if *url* points to a Copilot / GitHub Models API endpoint.
+
+    Checks the well-known cloud endpoints and also the custom
+    COPILOT_API_BASE_URL so GHE deployments are correctly detected.
+    """
+    lower = (url or "").lower().rstrip("/")
+    custom = os.getenv("COPILOT_API_BASE_URL", "").lower().rstrip("/")
+    return (
+        "api.githubcopilot.com" in lower
+        or "models.github.ai" in lower
+        or bool(custom and custom in lower)
+    )
 
 
 def validate_copilot_token(token: str) -> tuple[bool, str]:
@@ -69,7 +121,19 @@ def resolve_copilot_token() -> tuple[str, str]:
 
     Returns (token, source) where source describes where the token came from.
     Raises ValueError if only a classic PAT is available.
+
+    Respects ``COPILOT_AUTH_MODE``:
+      - ``oauth``  — skip env vars and ``gh auth token``; return empty so the
+                     caller falls through to the OAuth device-code flow.
+                     Useful on GHE where GH_TOKEN / GITHUB_TOKEN may be set to
+                     a non-Copilot scoped token.
+      - (unset)    — default behaviour: env vars → ``gh auth token``.
     """
+    auth_mode = os.getenv("COPILOT_AUTH_MODE", "").strip().lower()
+    if auth_mode == "oauth":
+        logger.debug("COPILOT_AUTH_MODE=oauth — skipping env vars and gh CLI")
+        return "", ""
+
     # 1. Check env vars in priority order
     for env_var in COPILOT_ENV_VARS:
         val = os.getenv(env_var, "").strip()
@@ -119,12 +183,16 @@ def _gh_cli_candidates() -> list[str]:
 def _try_gh_cli_token() -> Optional[str]:
     """Return a token from ``gh auth token`` when the GitHub CLI is available.
 
-    When COPILOT_GH_HOST is set, passes ``--hostname`` so gh returns the
-    correct host's token.  Also strips GITHUB_TOKEN / GH_TOKEN from the
-    subprocess environment so ``gh`` reads from its own credential store
-    (hosts.yml) instead of just echoing the env var back.
+    When ``COPILOT_GH_HOST`` is set (e.g. ``cancomictdev.ghe.com``), passes
+    ``--hostname`` so gh returns the token for that GHE instance instead of
+    whichever host is the active default.
+
+    GITHUB_TOKEN / GH_TOKEN are stripped from the subprocess env so ``gh``
+    reads from its own credential store (hosts.yml) rather than short-circuiting
+    by echoing the env var back — this is especially important on GHE where
+    GITHUB_TOKEN may be scoped to the enterprise and not valid for Copilot.
     """
-    hostname = os.getenv("COPILOT_GH_HOST", "").strip()
+    gh_host = os.getenv("COPILOT_GH_HOST", "").strip()
 
     # Build a clean env so gh doesn't short-circuit on GITHUB_TOKEN / GH_TOKEN
     clean_env = {k: v for k, v in os.environ.items()
@@ -132,8 +200,8 @@ def _try_gh_cli_token() -> Optional[str]:
 
     for gh_path in _gh_cli_candidates():
         cmd = [gh_path, "auth", "token"]
-        if hostname:
-            cmd += ["--hostname", hostname]
+        if gh_host:
+            cmd += ["--hostname", gh_host]
         try:
             result = subprocess.run(
                 cmd,
@@ -163,13 +231,16 @@ def copilot_device_code_login(
     the OAuth access token on success, or None on failure/cancellation.
 
     This replicates the flow used by opencode and the Copilot CLI.
+
+    The ``host`` parameter is accepted for backwards compatibility but the
+    module-level constants ``COPILOT_DEVICE_CODE_URL`` / ``COPILOT_ACCESS_TOKEN_URL``
+    take precedence.  For GHE, set those env vars instead of passing ``host``.
     """
     import urllib.request
     import urllib.parse
 
-    domain = host.rstrip("/")
-    device_code_url = f"https://{domain}/login/device/code"
-    access_token_url = f"https://{domain}/login/oauth/access_token"
+    device_code_url = COPILOT_DEVICE_CODE_URL
+    access_token_url = COPILOT_ACCESS_TOKEN_URL
 
     # Step 1: Request device code
     data = urllib.parse.urlencode({
@@ -212,9 +283,9 @@ def copilot_device_code_login(
     print("  Waiting for authorization...", end="", flush=True)
 
     # Step 3: Poll for completion
-    deadline = time.monotonic() + timeout_seconds
+    deadline = time.time() + timeout_seconds
 
-    while time.monotonic() < deadline:
+    while time.time() < deadline:
         time.sleep(interval + _DEVICE_CODE_POLL_SAFETY_MARGIN)
 
         poll_data = urllib.parse.urlencode({
@@ -283,7 +354,11 @@ _jwt_cache: dict[str, tuple[str, float]] = {}
 _JWT_REFRESH_MARGIN_SECONDS = 120  # refresh 2 min before expiry
 
 # Token exchange endpoint and headers (matching VS Code / Copilot CLI)
-_TOKEN_EXCHANGE_URL = "https://api.github.com/copilot_internal/v2/token"
+# For GHE: set COPILOT_TOKEN_EXCHANGE_URL=https://api.<tenant>.ghe.com/copilot_internal/v2/token
+_TOKEN_EXCHANGE_URL = os.getenv(
+    "COPILOT_TOKEN_EXCHANGE_URL",
+    "https://api.github.com/copilot_internal/v2/token",
+)
 _EDITOR_VERSION = "vscode/1.104.1"
 _EXCHANGE_USER_AGENT = "GitHubCopilotChat/0.26.7"
 
@@ -297,8 +372,10 @@ def _token_fingerprint(raw_token: str) -> str:
 def exchange_copilot_token(raw_token: str, *, timeout: float = 10.0) -> tuple[str, float]:
     """Exchange a raw GitHub token for a short-lived Copilot API token.
 
-    Calls ``GET https://api.github.com/copilot_internal/v2/token`` with
-    the raw GitHub token and returns ``(api_token, expires_at)``.
+    Calls the token exchange endpoint (default:
+    ``GET https://api.github.com/copilot_internal/v2/token``) and returns
+    ``(api_token, expires_at)``.  Override the endpoint via
+    ``COPILOT_TOKEN_EXCHANGE_URL`` for GitHub Enterprise.
 
     The returned token is a semicolon-separated string (not a standard JWT)
     used as ``Authorization: Bearer <token>`` for Copilot API requests.
